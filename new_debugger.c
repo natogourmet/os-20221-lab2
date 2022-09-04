@@ -23,48 +23,19 @@ struct debugee
     pid_t pid;
 };
 
-struct reg_descriptor
-{
-    int dwarf_r;
-    char *name;
-};
-
-const int n_registers = 27;
-
-const struct reg_descriptor g_register_descriptors[] = {
-    {0, "r15"},
-    {1, "r14"},
-    {2, "r13"},
-    {3, "r12"},
-    {4, "rbp"},
-    {5, "rbx"},
-    {6, "r11"},
-    {7, "r10"},
-    {8, "r9"},
-    {9, "r8"},
-    {10, "rax"},
-    {11, "rcx"},
-    {12, "rdx"},
-    {13, "rsi"},
-    {14, "rdi"},
-    {15, "orig_rax"},
-    {16, "rip"},
-    {17, "cs"},
-    {18, "eflags"},
-    {19, "rsp"},
-    {20, "ss"},
-    {21, "fs_base"},
-    {22, "gs_base"},
-    {23, "ds"},
-    {24, "es"},
-    {25, "fs"},
-    {26, "gs"},
-};
-
 void handle_command(char *);
+void continue_program();
+void next_step();
+void enable_breakpoint(int bpIdx, long addr);
+void disable_breakpoint(int bpIdx);
+void jump_to_addr(char *addr);
+void print_help();
+
+void step_by_step();
 
 struct debugee *child;
 struct breakpoint *breakpt;
+struct breakpoint *breakpts[10];
 
 int main(int argc, char *argv[])
 {
@@ -76,6 +47,11 @@ int main(int argc, char *argv[])
     child = (struct debugee *)malloc(sizeof(struct debugee));
     breakpt = (struct breakpoint *)malloc(sizeof(struct breakpoint));
     breakpt->active = 0;
+    for (int i = 0; i < 10; i++)
+    {
+        breakpts[i] = (struct breakpoint *)malloc(sizeof(struct breakpoint));
+        breakpts[i]->active = 0;
+    }
 
     child->name = argv[1];
     child->pid = fork();
@@ -88,6 +64,11 @@ int main(int argc, char *argv[])
     }
     else if (child->pid >= 1)
     {
+        print_help();
+
+        struct user_regs_struct regs;
+        uint64_t *rip_register_address = (uint64_t *)&(regs.rip);
+
         int status;
         int options = 0;
         waitpid(child->pid, &status, options);
@@ -97,6 +78,9 @@ int main(int argc, char *argv[])
             handle_command(line);
             linenoiseHistoryAdd(line);
             linenoiseFree(line);
+
+            ptrace(PTRACE_GETREGS, child->pid, NULL, &regs);
+            printf("\nPC: %lu\n", *rip_register_address);
         }
     }
 
@@ -105,21 +89,101 @@ int main(int argc, char *argv[])
     return 0;
 }
 
+void print_help()
+{
+    printf("usage:\n");
+    printf("\tcontinue \t\n");
+    printf("\tbreak    \t<brkpt idx> <instruction addr>\n");
+    printf("\tunbreak  \t<brkpt idx>\n");
+    printf("\tjump     \t<instruction addr>\n");
+    printf("\n");
+    // printf("\tunbreak  \t<brkpt idx>\n");
+}
+
+void continue_program()
+{
+    // step_over(0);
+    ptrace(PTRACE_CONT, child->pid, NULL, NULL);
+    int status;
+    int options = 0;
+    waitpid(child->pid, &status, options);
+}
+
+void next_step()
+{
+    ptrace(PTRACE_SINGLESTEP, child->pid, NULL, NULL);
+    int status;
+    int options = 0;
+    waitpid(child->pid, &status, options);
+}
+
+void step_by_step()
+{
+    int status;
+    struct user_regs_struct regs;
+    while (1)
+    {
+        ptrace(PTRACE_GETREGS, child->pid, NULL, &regs);
+        printf("eip: %lu\n", (uint64_t)regs.rip);
+        ptrace(PTRACE_SINGLESTEP, child->pid, NULL, NULL);
+        waitpid(child->pid, &status, 0);
+        if (WIFEXITED(status))
+            break;
+    }
+    printf("end\n");
+}
+
+void enable_breakpoint(int bpIdx, long addr)
+{
+    if (bpIdx > 9)
+    {
+        printf("Breakpoint %d is not a valid breakpoint\n", bpIdx);
+        return;
+    }
+    if (breakpts[bpIdx]->active == 1)
+    {
+        printf("Breakpoint %d is already occupied, use another one or free this one\n", bpIdx);
+        // disable_breakpoint(bpIdx);
+        return;
+    }
+    breakpts[bpIdx]->addr = addr;
+    uint64_t data = ptrace(PTRACE_PEEKDATA, child->pid, breakpts[bpIdx]->addr, NULL);
+    breakpts[bpIdx]->prev_opcode = (uint8_t)(data & 0xff);
+    uint64_t int3 = 0xcc;
+    uint64_t data_with_int3 = ((data & ~0xff) | int3);
+    ptrace(PTRACE_POKEDATA, child->pid, breakpts[bpIdx]->addr, data_with_int3);
+    breakpts[bpIdx]->active = 1;
+}
+
+void disable_breakpoint(int bpIdx)
+{
+    if (bpIdx > 9)
+    {
+        printf("Breakpoint %d is not a valid breakpoint\n", bpIdx);
+        return;
+    }
+    if (breakpts[bpIdx]->active == 0)
+    {
+        printf("Breakpoint %d is already free\n", bpIdx);
+        return;
+    }
+    uint64_t data = ptrace(PTRACE_PEEKDATA, child->pid, breakpts[bpIdx]->addr, NULL);
+    uint64_t restored_data = ((data & ~0xff) | breakpts[bpIdx]->prev_opcode);
+    ptrace(PTRACE_POKEDATA, child->pid, breakpts[bpIdx]->addr, restored_data);
+    breakpts[bpIdx]->active = 0;
+}
+
+void jump_to_addr(char *addr)
+{
+    struct user_regs_struct regs;
+    ptrace(PTRACE_GETREGS, child->pid, NULL, &regs);
+    uint64_t *rip_register_address = (uint64_t *)&(regs.rip);
+    *rip_register_address = (uint64_t)strtol(addr, NULL, 0);
+    ptrace(PTRACE_SETREGS, child->pid, NULL, &regs);
+}
+
 void handle_command(char *line)
 {
-    // At this point you must to implement all the logic to manage the inputs of the program:
-    // continue -> To continue the execution of the program
-    // next -> To go step by step
-    // register write/read <reg_name> <value>(when write format 0xVALUE) -> To read/write the value of a register (see the global variable g_register_descriptors)
-    // break <0xVALUE> (Hexadecimal) -> To put a breakpoint in an adress
-
-    // The following lines show a basic example of how to use the PTRACE API
-
-    // Read the registers
-    struct user_regs_struct regs;
-    uint64_t *register_address;
-    ptrace(PTRACE_GETREGS, child->pid, NULL, &regs);
-
     char *inputs[5];
     int input_counter = 0;
     char *line_copy;
@@ -140,60 +204,26 @@ void handle_command(char *line)
 
     if (strcmp(operation, "continue") == 0)
     {
-        printf("continue\n");
+        continue_program();
     }
     else if (strcmp(operation, "next") == 0)
     {
-        printf("next\n");
-
+        step_by_step();
     }
     else if (strcmp(operation, "break") == 0)
     {
-        printf("break\n");
-
+        enable_breakpoint(atoi(inputs[1]), (uint64_t)strtol(inputs[2], NULL, 0));
     }
-    else if (strcmp(operation, "register") == 0)
+    else if (strcmp(operation, "unbreak") == 0)
     {
-        printf("register\n");
-
+        disable_breakpoint(atoi(inputs[1]));
+    }
+    else if (strcmp(operation, "jump") == 0)
+    {
+        jump_to_addr(inputs[1]);
     }
     else
     {
         printf("Invalid Input\n");
     }
-
-
-    // //Write the registers -> If you want to change a register, you must to read them first using the previous call, modify the struct user_regs_struct
-    // //(the register that you want to change) and then use the following call
-    // ptrace(PTRACE_SETREGS, child->pid, NULL, &regs);
-
-    // //If you want to enable a breakpoint (in a provided adress, for example 0x555555554655), you must to use the following CALL
-    // breakpt->addr =  ((uint64_t)strtol("0x555555554655", NULL, 0));
-    // uint64_t data = ptrace(PTRACE_PEEKDATA, child->pid, breakpt->addr, NULL);
-    // breakpt->prev_opcode = (uint8_t)(data & 0xff);
-    // uint64_t int3 = 0xcc;
-    // uint64_t data_with_int3 = ((data & ~0xff) | int3);
-    // ptrace(PTRACE_POKEDATA, child->pid, breakpt->addr, data_with_int3);
-    // breakpt->active = 1;
-
-    // //To disable a breakpoint
-    // data = ptrace(PTRACE_PEEKDATA, child->pid, breakpt->addr, NULL);
-    // uint64_t restored_data = ((data & ~0xff) | breakpt->prev_opcode);
-    // ptrace(PTRACE_POKEDATA, child->pid, breakpt->addr, restored_data);
-    // breakpt->active = 0;
-
-    // //To execute a singe step
-    // ptrace(PTRACE_SINGLESTEP, child->pid, NULL, NULL);
-
-    // //To read the value in a memory adress
-    // uint64_t value_in_memory = (uint64_t)ptrace(PTRACE_PEEKDATA, child->pid, (uint64_t)strtol("0x555555554655", NULL, 0), NULL);
-
-    // //To write a value in an adress
-    // ptrace(PTRACE_POKEDATA, child->pid, (uint64_t)strtol("0x555555554655", NULL, 0), (uint64_t)strtol("0x555555554655", NULL, 0));
-
-    // If you want to continue with the execution of the debugee program
-//     ptrace(PTRACE_CONT, child->pid, NULL, NULL);
-//     int status;
-//     int options = 0;
-//     waitpid(child->pid, &status, options);
 }
